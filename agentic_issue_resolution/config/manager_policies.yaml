@@ -1,0 +1,80 @@
+selector:
+  enabled_live: true
+  category_key: team_profile|ticket_type|risk_tier
+  default_policy_id: manager_groq_v1
+  candidate_policy_ids:
+    - manager_groq_v1
+    - manager_or_fast_v1
+  epsilon: 0.15
+  min_samples: 6
+
+policies:
+  - id: manager_or_fast_v1
+    type: llm_api
+    provider: openrouter
+    api_key_env: OPENROUTER_API_KEY
+    base_url_env: OPENROUTER_BASE_URL
+    model_env: MANAGER_OPENROUTER_MODEL
+    model_default: arcee-ai/trinity-large-preview:free
+    max_new_tokens: 320
+    temperature: 0.0
+    max_attempts: 2
+    input_cost_coef: 0.0030
+    output_cost_coef: 0.0050
+
+  - id: manager_groq_v1
+    type: llm_api
+    provider: groq
+    api_key_env: GROQ_API_KEY
+    base_url_env: GROQ_BASE_URL
+    model_env: MANAGER_GROQ_MODEL
+    model_default: llama-3.3-70b-versatile
+    max_new_tokens: 320
+    temperature: 0.0
+    max_attempts: 2
+    input_cost_coef: 0.0035
+    output_cost_coef: 0.0065
+
+  - id: judge_gemini_v1
+    type: llm_api
+    provider: gemini
+    api_key_env: GEMINI_API_KEY
+    base_url_env: GEMINI_API_BASE
+    model_env: JUDGE_GEMINI_MODEL
+    model_default: gemini-1.5-pro
+    max_new_tokens: 320
+    temperature: 0.0
+    max_attempts: 1
+    input_cost_coef: 0.0040
+    output_cost_coef: 0.0080
+
+  - id: judge_or_v1
+    type: llm_api
+    provider: openrouter
+    api_key_env: OPENROUTER_API_KEY
+    base_url_env: OPENROUTER_BASE_URL
+    model_env: JUDGE_OPENROUTER_MODEL
+    model_default: arcee-ai/trinity-large-preview:free
+    max_new_tokens: 320
+    temperature: 0.0
+    max_attempts: 1
+    input_cost_coef: 0.0040
+    output_cost_coef: 0.0080
+
+  - id: judge_groq_v1
+    type: llm_api
+    provider: groq
+    api_key_env: GROQ_API_KEY
+    base_url_env: GROQ_BASE_URL
+    model_env: JUDGE_GROQ_MODEL
+    model_default: llama-3.3-70b-versatile
+    max_new_tokens: 320
+    temperature: 0.0
+    max_attempts: 1
+    input_cost_coef: 0.0040
+    output_cost_coef: 0.0085
+
+judge:
+  policy_id: judge_gemini_v1
+  max_tokens: 300
+  temperature: 0.0
