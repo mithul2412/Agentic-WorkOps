@@ -1,0 +1,15 @@
+{
+  "webhookEvent": "jira:issue_created",
+  "issue": {
+    "key": "ENG-123",
+    "fields": {
+      "summary": "Login callback returns 500 after password reset",
+      "description": "Steps to reproduce: reset password, then complete OAuth callback. Expected success, actual 500 with KeyError in logs.",
+      "labels": ["auth", "incident"]
+    }
+  },
+  "user": {
+    "displayName": "Reporter One",
+    "emailAddress": "reporter@example.com"
+  }
+}
