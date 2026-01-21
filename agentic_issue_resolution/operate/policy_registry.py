@@ -28,15 +28,15 @@ class PolicyDefinition:
 class SelectorSettings:
     enabled_live: bool = True
     category_key: str = "team_profile|ticket_type|risk_tier"
-    default_policy_id: str = "manager_groq_v1"
-    candidate_policy_ids: tuple[str, ...] = ("manager_groq_v1", "manager_or_fast_v1")
+    default_policy_id: str = "manager_ollama_qwen25_sft_v1"
+    candidate_policy_ids: tuple[str, ...] = ("manager_ollama_qwen25_sft_v1", "manager_ollama_gemma2_local_v1")
     epsilon: float = 0.10
     min_samples: int = 10
 
 
 @dataclass(frozen=True)
 class JudgeSettings:
-    policy_id: str = "judge_gemini_v1"
+    policy_id: str = "judge_groq_v1"
     max_tokens: int = 300
     temperature: float = 0.0
 
@@ -84,14 +84,19 @@ class PolicyRegistry:
     def _parse_selector(self, selector_row: dict[str, Any]) -> SelectorSettings:
         if not isinstance(selector_row, dict):
             return SelectorSettings()
-        candidates_raw = selector_row.get("candidate_policy_ids", ["manager_groq_v1", "manager_or_fast_v1"])
+        candidates_raw = selector_row.get(
+            "candidate_policy_ids",
+            ["manager_ollama_qwen25_sft_v1", "manager_ollama_gemma2_local_v1"],
+        )
         candidate_ids = tuple(str(item).strip() for item in candidates_raw if str(item).strip())
         if not candidate_ids:
-            candidate_ids = ("manager_groq_v1", "manager_or_fast_v1")
+            candidate_ids = ("manager_ollama_qwen25_sft_v1", "manager_ollama_gemma2_local_v1")
         return SelectorSettings(
             enabled_live=bool(selector_row.get("enabled_live", True)),
             category_key=str(selector_row.get("category_key", "team_profile|ticket_type|risk_tier")).strip(),
-            default_policy_id=str(selector_row.get("default_policy_id", "manager_groq_v1")).strip(),
+            default_policy_id=str(
+                selector_row.get("default_policy_id", "manager_ollama_qwen25_sft_v1")
+            ).strip(),
             candidate_policy_ids=candidate_ids,
             epsilon=float(selector_row.get("epsilon", 0.10)),
             min_samples=max(1, int(selector_row.get("min_samples", 10))),
@@ -101,7 +106,7 @@ class PolicyRegistry:
         if not isinstance(row, dict):
             return JudgeSettings()
         return JudgeSettings(
-            policy_id=str(row.get("policy_id", "judge_gemini_v1")).strip(),
+            policy_id=str(row.get("policy_id", "judge_groq_v1")).strip(),
             max_tokens=max(50, int(row.get("max_tokens", 300))),
             temperature=float(row.get("temperature", 0.0)),
         )

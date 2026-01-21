@@ -119,4 +119,8 @@ class ManagerPolicySelector:
         if provider == "gemini":
             key_env = policy.api_key_env or "GEMINI_API_KEY"
             return bool(os.getenv(key_env, "").strip()) or bool(os.getenv("GOOGLE_API_KEY", "").strip())
+        if provider == "ollama":
+            if policy.model_env and os.getenv(policy.model_env, "").strip():
+                return True
+            return bool((policy.model_default or "").strip())
         return False
