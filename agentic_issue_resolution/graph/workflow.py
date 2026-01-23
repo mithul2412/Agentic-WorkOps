@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from agentic_issue_resolution.models.artifacts import (
     AuditorPack,
     CalendarProposal,
     CodingBrief,
+    ConfluenceDraft,
     DecisionType,
     PatchArtifact,
     EmailDraftArtifact,
@@ -57,6 +59,13 @@ from agentic_issue_resolution.tools.email import GoogleGmailClient, MockEmailCli
 from agentic_issue_resolution.tools.engineer_deepseek import GeminiEngineerClient
 from agentic_issue_resolution.tools.file_ops import read_target_files
 from agentic_issue_resolution.tools.jira import MockJiraClient, RealJiraClient
+from agentic_issue_resolution.tools.llm_provider import (
+    GeminiDirectClient,
+    GroqClient,
+    LLMRequest,
+    OllamaClient,
+    OpenRouterClient,
+)
 from agentic_issue_resolution.tools.tavily import MockTavilyClient, RealTavilyClient
 
 
@@ -212,6 +221,12 @@ class WorkflowOrchestrator:
             "operate": {"enabled": True, "selector_enabled_live": True},
             "autonomy": {"min_confidence": 0.72},
             "demo": {"force_ready_for_seeded_tickets": False},
+            "llm_comms": {
+                "enabled": True,
+                "provider": "ollama",
+                "temperature": 0.1,
+                "max_tokens": 900,
+            },
         }
         if not config_path.exists():
             return defaults
@@ -713,11 +728,11 @@ class WorkflowOrchestrator:
         operate_enabled = bool(self.config.get("operate", {}).get("enabled", True))
         if not operate_enabled:
             raise RuntimeError(
-                "Manager runtime is API-policy only. Enable `operate.enabled=true` to run manager decisions."
+                "Manager runtime is policy-driven. Enable `operate.enabled=true` to run manager decisions."
             )
         if not self.policy_registry or not self.policy_executor:
             raise RuntimeError(
-                "Manager runtime is API-policy only and requires manager policies at "
+                "Manager runtime requires configured manager policies at "
                 f"{self.config_path.parent / 'manager_policies.yaml'}."
             )
 
@@ -777,18 +792,89 @@ class WorkflowOrchestrator:
     def _node_ask_for_info(self, state: GraphState) -> GraphState:
         draft = state.get("jira_comment_draft", {})
         body = str(draft.get("body", "Need additional info"))
-        result = self.jira.add_comment(state["ticket_id"], body)
+        notify_emails = self._notification_emails(state)
+        comms_plan, comms_meta = self._build_human_loop_comms_plan(
+            state=state,
+            scenario="ask_for_info",
+            default_jira_body=body,
+            notify_emails=notify_emails,
+        )
+
+        result = self.jira.add_comment(state["ticket_id"], comms_plan["jira_comment_body"])
         self.jira.transition_status(state["ticket_id"], "WAITING_FOR_INFO")
+
+        self._ensure_tool("finalizer", "confluence_draft")
+        try:
+            kb_result = self.confluence.create_draft(comms_plan["confluence_title"], comms_plan["confluence_body"])
+            confluence_draft = ConfluenceDraft(
+                title=comms_plan["confluence_title"],
+                body=comms_plan["confluence_body"],
+                draft_id=str(kb_result.get("draft_id", "")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            fallback = MockConfluenceClient()
+            kb_result = fallback.create_draft(comms_plan["confluence_title"], comms_plan["confluence_body"])
+            confluence_draft = ConfluenceDraft(
+                title=str(kb_result.get("title", comms_plan["confluence_title"])),
+                body=str(kb_result.get("body", comms_plan["confluence_body"]))
+                + f"\n\n[Confluence fallback reason: {exc}]",
+                draft_id=str(kb_result.get("draft_id", "")),
+            )
+
+        self._ensure_tool("finalizer", "calendar")
+        duration_minutes = int(comms_plan.get("meeting_duration_minutes", 30))
+        try:
+            slots = self.calendar.find_free_slots(notify_emails, duration_minutes=duration_minutes, max_slots=3)
+            calendar_proposal = self.calendar.propose_slots(
+                slots,
+                duration_minutes=duration_minutes,
+                timezone_name=self.config.get("timezone", "UTC"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            fallback = MockCalendarClient()
+            slots = fallback.find_free_slots(notify_emails, duration_minutes=duration_minutes, max_slots=3)
+            calendar_proposal = fallback.propose_slots(slots, duration_minutes=duration_minutes, timezone_name="UTC")
+            calendar_proposal.ics = (calendar_proposal.ics or "") + f"\n# calendar_fallback_reason={exc}"
+
+        email_body = (
+            f"{comms_plan['email_body']}\n\n"
+            f"Suggested sync objective: {comms_plan['meeting_objective']}\n"
+            "Suggested slots:\n- " + "\n- ".join(calendar_proposal.slots)
+        )
+        self._ensure_tool("finalizer", "email")
+        try:
+            email_draft = self.email.create_draft(notify_emails, comms_plan["email_subject"], email_body)
+        except Exception as exc:  # noqa: BLE001
+            email_draft = EmailDraftArtifact(
+                to=notify_emails,
+                subject=comms_plan["email_subject"],
+                body=email_body + f"\n\n[Fallback draft mode due to error: {exc}]",
+                provider_draft_id=None,
+            )
+
         updates: GraphState = {
             "status": RunStatus.WAITING_FOR_INFO.value,
             "jira_comment_id": str(result.get("comment_id")),
+            "jira_comment_draft": {"body": comms_plan["jira_comment_body"]},
+            "confluence_draft": confluence_draft.model_dump(mode="json"),
+            "calendar_proposal": CalendarProposal.model_validate(calendar_proposal).model_dump(mode="json"),
+            "email_draft": EmailDraftArtifact.model_validate(email_draft).model_dump(mode="json"),
         }
         updates = self._apply_updates_with_event(
             state,
             updates,
             step="ask_for_info",
-            event_type="tool_call",
-            payload={"tool": "jira.add_comment", "comment_id": result.get("comment_id")},
+            event_type="artifact",
+            payload={
+                "artifact": "human_loop_comms",
+                "comment_id": result.get("comment_id"),
+                "llm_mode": comms_meta.get("mode"),
+                "llm_reason": comms_meta.get("reason"),
+                "llm_provider": comms_meta.get("provider"),
+                "llm_model": comms_meta.get("model"),
+                "tavily_hits": comms_meta.get("tavily_hits", 0),
+                "meeting_slots": len(calendar_proposal.slots),
+            },
         )
         return updates
 
@@ -986,7 +1072,7 @@ class WorkflowOrchestrator:
         )
 
         self._ensure_tool("finalizer", "confluence_draft")
-        kb_draft = build_confluence_draft(
+        default_kb_draft = build_confluence_draft(
             ticket_id=state["ticket_id"],
             context={
                 "summary": brief.summary,
@@ -996,33 +1082,65 @@ class WorkflowOrchestrator:
                 "prevention": f"Capture lessons in tests and monitoring.{escalation_suffix}",
             },
         )
-        kb_result = self.confluence.create_draft(kb_draft.title, kb_draft.body)
-        kb_draft.draft_id = str(kb_result.get("draft_id", ""))
-
         notify_emails = self._notification_emails(state)
+        comms_plan, comms_meta = self._build_human_loop_comms_plan(
+            state=state,
+            scenario="post_patch_handoff",
+            default_jira_body="",
+            notify_emails=notify_emails,
+            default_confluence_title=default_kb_draft.title,
+            default_confluence_body=default_kb_draft.body,
+            default_email_subject=f"[{state['ticket_id']}] PR ready for review",
+            default_email_body=(
+                f"Ticket: {state['ticket_id']}\n"
+                f"PR: {pr.get('url')}\n"
+                f"Mode: {mode}\n"
+                f"Risk tier: {brief.risk_tier.value}\n"
+                "Please review and reply in Jira with feedback or approval notes."
+            ),
+        )
+        try:
+            kb_result = self.confluence.create_draft(comms_plan["confluence_title"], comms_plan["confluence_body"])
+            kb_draft = ConfluenceDraft(
+                title=comms_plan["confluence_title"],
+                body=comms_plan["confluence_body"],
+                draft_id=str(kb_result.get("draft_id", "")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            fallback = MockConfluenceClient()
+            kb_result = fallback.create_draft(comms_plan["confluence_title"], comms_plan["confluence_body"])
+            kb_draft = ConfluenceDraft(
+                title=str(kb_result.get("title", comms_plan["confluence_title"])),
+                body=str(kb_result.get("body", comms_plan["confluence_body"]))
+                + f"\n\n[Confluence fallback reason: {exc}]",
+                draft_id=str(kb_result.get("draft_id", "")),
+            )
 
         self._ensure_tool("finalizer", "calendar")
+        duration_minutes = int(comms_plan.get("meeting_duration_minutes", 30))
         try:
-            slots = self.calendar.find_free_slots(notify_emails, duration_minutes=30, max_slots=3)
+            slots = self.calendar.find_free_slots(notify_emails, duration_minutes=duration_minutes, max_slots=3)
             calendar_proposal = self.calendar.propose_slots(
                 slots,
-                duration_minutes=30,
+                duration_minutes=duration_minutes,
                 timezone_name=self.config.get("timezone", "UTC"),
             )
         except Exception as exc:  # noqa: BLE001
             fallback = MockCalendarClient()
-            slots = fallback.find_free_slots(notify_emails, duration_minutes=30, max_slots=3)
-            calendar_proposal = fallback.propose_slots(slots, duration_minutes=30, timezone_name="UTC")
+            slots = fallback.find_free_slots(notify_emails, duration_minutes=duration_minutes, max_slots=3)
+            calendar_proposal = fallback.propose_slots(
+                slots,
+                duration_minutes=duration_minutes,
+                timezone_name="UTC",
+            )
             calendar_proposal.ics = (calendar_proposal.ics or "") + f"\n# calendar_fallback_reason={exc}"
 
         self._ensure_tool("finalizer", "email")
         subject_prefix = "[ESCALATION] " if mode == "customer_escalation" else ""
-        subject = f"{subject_prefix}[{state['ticket_id']}] PR ready for review"
+        subject = f"{subject_prefix}{comms_plan['email_subject']}"
         body = (
-            f"Ticket: {state['ticket_id']}\n"
-            f"PR: {pr.get('url')}\n"
-            f"Mode: {mode}\n"
-            f"Risk tier: {brief.risk_tier.value}\n"
+            f"{comms_plan['email_body']}\n\n"
+            f"Suggested review objective: {comms_plan['meeting_objective']}\n"
             "Suggested review slots:\n- " + "\n- ".join(calendar_proposal.slots)
         )
         try:
@@ -1046,27 +1164,106 @@ class WorkflowOrchestrator:
             updates,
             step="kb_and_comms",
             event_type="artifact",
-            payload={"artifact": "knowledge_and_comms", "slots": calendar_proposal.slots},
+            payload={
+                "artifact": "knowledge_and_comms",
+                "slots": calendar_proposal.slots,
+                "llm_mode": comms_meta.get("mode"),
+                "llm_reason": comms_meta.get("reason"),
+                "llm_provider": comms_meta.get("provider"),
+                "llm_model": comms_meta.get("model"),
+                "tavily_hits": comms_meta.get("tavily_hits", 0),
+            },
         )
         return updates
 
     def _node_rejected(self, state: GraphState) -> GraphState:
         reviewer = state.get("approval", {}).get("reviewer", "reviewer")
         comments = state.get("approval", {}).get("comments", "")
+        notify_emails = self._notification_emails(state)
+        default_body = f"Patch was not approved by {reviewer}. Comments: {comments}"
+        comms_plan, comms_meta = self._build_human_loop_comms_plan(
+            state=state,
+            scenario="rejected_feedback",
+            default_jira_body=default_body,
+            notify_emails=notify_emails,
+            review_comments=comments,
+        )
         result = self.jira.add_comment(
             state["ticket_id"],
-            f"Patch was not approved by {reviewer}. Comments: {comments}",
+            comms_plan["jira_comment_body"],
         )
+        self._ensure_tool("finalizer", "calendar")
+        duration_minutes = int(comms_plan.get("meeting_duration_minutes", 30))
+        try:
+            slots = self.calendar.find_free_slots(notify_emails, duration_minutes=duration_minutes, max_slots=3)
+            calendar_proposal = self.calendar.propose_slots(
+                slots,
+                duration_minutes=duration_minutes,
+                timezone_name=self.config.get("timezone", "UTC"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            fallback = MockCalendarClient()
+            slots = fallback.find_free_slots(notify_emails, duration_minutes=duration_minutes, max_slots=3)
+            calendar_proposal = fallback.propose_slots(
+                slots,
+                duration_minutes=duration_minutes,
+                timezone_name="UTC",
+            )
+            calendar_proposal.ics = (calendar_proposal.ics or "") + f"\n# calendar_fallback_reason={exc}"
+
+        self._ensure_tool("finalizer", "email")
+        email_body = (
+            f"{comms_plan['email_body']}\n\n"
+            f"Meeting objective: {comms_plan['meeting_objective']}\n"
+            "Suggested slots:\n- " + "\n- ".join(calendar_proposal.slots)
+        )
+        try:
+            email_draft = self.email.create_draft(notify_emails, comms_plan["email_subject"], email_body)
+        except Exception as exc:  # noqa: BLE001
+            email_draft = EmailDraftArtifact(
+                to=notify_emails,
+                subject=comms_plan["email_subject"],
+                body=email_body + f"\n\n[Fallback draft mode due to error: {exc}]",
+                provider_draft_id=None,
+            )
+
+        self._ensure_tool("finalizer", "confluence_draft")
+        try:
+            kb_result = self.confluence.create_draft(comms_plan["confluence_title"], comms_plan["confluence_body"])
+            confluence_draft = ConfluenceDraft(
+                title=comms_plan["confluence_title"],
+                body=comms_plan["confluence_body"],
+                draft_id=str(kb_result.get("draft_id", "")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            fallback = MockConfluenceClient()
+            kb_result = fallback.create_draft(comms_plan["confluence_title"], comms_plan["confluence_body"])
+            confluence_draft = ConfluenceDraft(
+                title=str(kb_result.get("title", comms_plan["confluence_title"])),
+                body=str(kb_result.get("body", comms_plan["confluence_body"]))
+                + f"\n\n[Confluence fallback reason: {exc}]",
+                draft_id=str(kb_result.get("draft_id", "")),
+            )
         updates: GraphState = {
             "status": RunStatus.REJECTED.value,
             "jira_comment_id": str(result.get("comment_id")),
+            "confluence_draft": confluence_draft.model_dump(mode="json"),
+            "calendar_proposal": CalendarProposal.model_validate(calendar_proposal).model_dump(mode="json"),
+            "email_draft": EmailDraftArtifact.model_validate(email_draft).model_dump(mode="json"),
         }
         updates = self._apply_updates_with_event(
             state,
             updates,
             step="rejected",
-            event_type="state",
-            payload={"message": "workflow rejected by reviewer"},
+            event_type="artifact",
+            payload={
+                "message": "workflow rejected by reviewer",
+                "llm_mode": comms_meta.get("mode"),
+                "llm_reason": comms_meta.get("reason"),
+                "llm_provider": comms_meta.get("provider"),
+                "llm_model": comms_meta.get("model"),
+                "tavily_hits": comms_meta.get("tavily_hits", 0),
+            },
         )
         return updates
 
@@ -1148,6 +1345,299 @@ class WorkflowOrchestrator:
         if not emails:
             emails = ["engineering@example.com"]
         return emails
+
+    def _build_human_loop_comms_plan(
+        self,
+        state: GraphState,
+        scenario: str,
+        default_jira_body: str,
+        notify_emails: list[str],
+        review_comments: str | None = None,
+        default_confluence_title: str | None = None,
+        default_confluence_body: str | None = None,
+        default_email_subject: str | None = None,
+        default_email_body: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        ticket_id = str(state.get("ticket_id", "")).strip()
+        jira_ticket = state.get("jira_ticket", {})
+        summary = str(jira_ticket.get("summary", "")).strip() or ticket_id
+        description = str(jira_ticket.get("description", "")).strip()
+        mode = str(state.get("mode", "")).strip().lower() or "incident"
+        risk_tier = str((state.get("manager_output") or {}).get("risk_tier", "")).strip().lower() or "unknown"
+        manager_output = state.get("manager_output") or {}
+        raw_questions = manager_output.get("questions_needed", [])
+        questions = [str(item).strip() for item in raw_questions if str(item).strip()] if isinstance(raw_questions, list) else []
+        reviewer_notes = (review_comments or "").strip()
+        pr_url = str((state.get("pr_artifact") or {}).get("url", "")).strip()
+
+        web_hits: list[dict[str, str]] = []
+        if self.config.get("enable_tavily", True):
+            query_candidates = [summary]
+            query_candidates.extend(questions[:2])
+            if reviewer_notes:
+                query_candidates.append(reviewer_notes[:180])
+            deduped_queries: list[str] = []
+            for query in query_candidates:
+                cleaned = str(query).strip()
+                if not cleaned or cleaned in deduped_queries:
+                    continue
+                deduped_queries.append(cleaned)
+            try:
+                self._ensure_tool("manager", "tavily_search")
+                for query in deduped_queries[:2]:
+                    results = self.tavily.search(query, max_results=2)
+                    for item in results:
+                        snippet = str(item.get("snippet", "")).strip()
+                        title = str(item.get("title", "")).strip()
+                        url = str(item.get("url", "")).strip()
+                        if snippet or title:
+                            web_hits.append(
+                                {
+                                    "query": query,
+                                    "title": title[:200],
+                                    "url": url[:500],
+                                    "snippet": snippet[:500],
+                                }
+                            )
+            except Exception:
+                web_hits = []
+
+        scenario_title = {
+            "ask_for_info": "Discovery loop: additional ticket details required",
+            "rejected_feedback": "Rework loop: reviewer requested changes",
+            "post_patch_handoff": "Handoff loop: patch ready for validation and communication",
+        }.get(scenario, "Human loop follow-up")
+
+        default_email_subject = default_email_subject or f"[{ticket_id}] Action required: additional details needed"
+        default_email_body = default_email_body or (
+            f"Ticket: {ticket_id}\n"
+            f"Summary: {summary}\n"
+            f"Mode: {mode}\n"
+            f"Risk tier: {risk_tier}\n"
+            "Please help unblock this ticket by sharing missing details in Jira.\n"
+            + (
+                "Required details:\n- " + "\n- ".join(questions)
+                if questions
+                else "Required details: steps to reproduce, expected/actual behavior, environment, and logs."
+            )
+        )
+        default_confluence_title = default_confluence_title or f"[Draft] Human loop notes for {ticket_id}"
+        default_confluence_body = default_confluence_body or (
+            "## Current status\n"
+            f"{scenario_title}\n\n"
+            "## Ticket summary\n"
+            f"{summary}\n\n"
+            "## Missing details\n"
+            + (
+                "\n".join(f"- {question}" for question in questions)
+                if questions
+                else "- Need reproduction details, logs, and environment information."
+            )
+            + "\n\n## Reviewer notes\n"
+            + (reviewer_notes or "No reviewer notes.")
+            + "\n\n## Web context (Tavily)\n"
+            + (
+                "\n".join(
+                    f"- {item.get('title', 'Context')}: {item.get('snippet', '')} ({item.get('url', '')})"
+                    for item in web_hits[:4]
+                )
+                if web_hits
+                else "- No external context captured."
+            )
+        )
+
+        plan: dict[str, Any] = {
+            "jira_comment_body": str(default_jira_body).strip() or "Additional information is required.",
+            "email_subject": default_email_subject,
+            "email_body": default_email_body,
+            "meeting_objective": "Align on missing context, unblock decision-making, and confirm next owner/actions.",
+            "meeting_duration_minutes": 30,
+            "confluence_title": default_confluence_title,
+            "confluence_body": default_confluence_body,
+        }
+        meta: dict[str, Any] = {
+            "mode": "deterministic",
+            "reason": "llm_comms_disabled",
+            "provider": None,
+            "model": None,
+            "tavily_hits": len(web_hits),
+        }
+
+        llm_cfg = self.config.get("llm_comms", {})
+        enabled_raw = llm_cfg.get("enabled", True)
+        enabled = str(enabled_raw).strip().lower() not in {"0", "false", "no", "off"}
+        if not enabled:
+            return plan, meta
+
+        llm_payload = {
+            "scenario": scenario,
+            "ticket_id": ticket_id,
+            "summary": summary,
+            "description": description,
+            "mode": mode,
+            "risk_tier": risk_tier,
+            "notify_emails": notify_emails,
+            "questions_needed": questions,
+            "review_comments": reviewer_notes,
+            "pr_url": pr_url,
+            "web_context": web_hits,
+            "defaults": plan,
+        }
+        try:
+            llm_out, llm_meta = self._run_comms_llm(llm_payload)
+            for key in (
+                "jira_comment_body",
+                "email_subject",
+                "email_body",
+                "meeting_objective",
+                "confluence_title",
+                "confluence_body",
+            ):
+                value = str(llm_out.get(key, "")).strip()
+                if value:
+                    plan[key] = value
+            duration_raw = llm_out.get("meeting_duration_minutes", plan["meeting_duration_minutes"])
+            try:
+                duration = int(duration_raw)
+            except Exception:
+                duration = int(plan["meeting_duration_minutes"])
+            plan["meeting_duration_minutes"] = max(15, min(duration, 90))
+            meta = {
+                "mode": "llm",
+                "reason": f"provider={llm_meta.get('provider')};model={llm_meta.get('model')}",
+                "provider": llm_meta.get("provider"),
+                "model": llm_meta.get("model"),
+                "tavily_hits": len(web_hits),
+            }
+        except Exception as exc:  # noqa: BLE001
+            meta = {
+                "mode": "deterministic_fallback",
+                "reason": str(exc),
+                "provider": None,
+                "model": None,
+                "tavily_hits": len(web_hits),
+            }
+        return plan, meta
+
+    def _run_comms_llm(self, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        llm_cfg = self.config.get("llm_comms", {})
+        provider = str(llm_cfg.get("provider", os.getenv("COMMS_LLM_PROVIDER", "ollama"))).strip().lower() or "ollama"
+        model = self._resolve_comms_model(provider)
+        if not model:
+            raise RuntimeError(f"missing comms model for provider={provider}")
+        temperature = float(llm_cfg.get("temperature", os.getenv("COMMS_LLM_TEMPERATURE", "0.1")))
+        max_tokens = int(llm_cfg.get("max_tokens", os.getenv("COMMS_LLM_MAX_TOKENS", "900")))
+        client = self._comms_provider_client(provider=provider, model=model)
+        response = client.chat(
+            LLMRequest(
+                system=(
+                    "You are a communications copilot for incident and ticket operations.\n"
+                    "Return ONLY one JSON object with no markdown and no extra text.\n"
+                    "Schema:\n"
+                    "{\n"
+                    '  "jira_comment_body": string,\n'
+                    '  "email_subject": string,\n'
+                    '  "email_body": string,\n'
+                    '  "meeting_objective": string,\n'
+                    '  "meeting_duration_minutes": number,\n'
+                    '  "confluence_title": string,\n'
+                    '  "confluence_body": string\n'
+                    "}\n"
+                    "Rules:\n"
+                    "- keep content concise and actionable.\n"
+                    "- preserve factual details from provided ticket context.\n"
+                    "- do not invent ticket IDs or system states.\n"
+                ),
+                user=json.dumps(payload, ensure_ascii=False),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                expect_json=True,
+            ),
+            model=model,
+        )
+        parsed = json.loads(self._extract_first_json(response.text))
+        if not isinstance(parsed, dict):
+            raise ValueError("comms llm output must be a JSON object")
+        return (
+            parsed,
+            {
+                "provider": response.provider,
+                "model": response.model,
+                "latency_ms": response.latency_ms,
+            },
+        )
+
+    def _comms_provider_client(self, provider: str, model: str):
+        if provider == "ollama":
+            base_url = os.getenv("COMMS_OLLAMA_BASE_URL", "").strip() or os.getenv("OLLAMA_BASE_URL", "").strip() or None
+            return OllamaClient(default_model=model, base_url=base_url)
+
+        if provider == "openrouter":
+            api_key = os.getenv("COMMS_OPENROUTER_API_KEY", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+            base_url = (
+                os.getenv("COMMS_OPENROUTER_BASE_URL", "").strip()
+                or os.getenv("OPENROUTER_BASE_URL", "").strip()
+                or None
+            )
+            return OpenRouterClient(api_key=api_key, default_model=model, base_url=base_url)
+
+        if provider == "groq":
+            api_key = os.getenv("COMMS_GROQ_API_KEY", "").strip() or os.getenv("GROQ_API_KEY", "").strip()
+            base_url = os.getenv("COMMS_GROQ_BASE_URL", "").strip() or os.getenv("GROQ_BASE_URL", "").strip() or None
+            return GroqClient(api_key=api_key, default_model=model, base_url=base_url)
+
+        if provider == "gemini":
+            api_key = os.getenv("COMMS_GEMINI_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+            base_url = os.getenv("COMMS_GEMINI_BASE_URL", "").strip() or os.getenv("GEMINI_API_BASE", "").strip() or None
+            return GeminiDirectClient(api_key=api_key, default_model=model, base_url=base_url)
+
+        raise RuntimeError(f"unsupported comms llm provider: {provider}")
+
+    def _resolve_comms_model(self, provider: str) -> str:
+        env_map = {
+            "ollama": ("COMMS_OLLAMA_MODEL", "MANAGER_OLLAMA_MODEL"),
+            "openrouter": ("COMMS_OPENROUTER_MODEL", "MANAGER_OPENROUTER_MODEL", "OPENROUTER_MODEL"),
+            "groq": ("COMMS_GROQ_MODEL", "MANAGER_GROQ_MODEL", "JUDGE_GROQ_MODEL", "GROQ_MODEL"),
+            "gemini": ("COMMS_GEMINI_MODEL", "JUDGE_GEMINI_MODEL", "ENGINEER_GEMINI_MODEL", "GEMINI_MODEL"),
+        }.get(provider, ())
+        for env_name in env_map:
+            value = os.getenv(env_name, "").strip()
+            if value:
+                return value
+        defaults = {
+            "ollama": "qwen2.5:3b-instruct",
+            "openrouter": "openai/gpt-4o-mini",
+            "groq": "llama-3.3-70b-versatile",
+            "gemini": "gemini-2.5-flash",
+        }
+        return defaults.get(provider, "")
+
+    def _extract_first_json(self, text: str) -> str:
+        start = text.find("{")
+        if start < 0:
+            raise ValueError("no JSON object found in LLM response")
+        depth = 0
+        in_string = False
+        escape = False
+        for idx, ch in enumerate(text[start:], start=start):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == "\"":
+                    in_string = False
+                continue
+            if ch == "\"":
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        raise ValueError("incomplete JSON object in LLM response")
 
     def _derive_mode_and_team(
         self,

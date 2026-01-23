@@ -163,6 +163,8 @@ def replay(ticket_id: str) -> ReplayResponse:
 @app.get("/integrations/status")
 def integrations_status() -> dict:
     keys = [
+        "OLLAMA_BASE_URL",
+        "MANAGER_OLLAMA_MODEL",
         "MANAGER_OPENROUTER_MODEL",
         "OPENROUTER_MODEL",
         "MANAGER_GROQ_MODEL",
@@ -179,6 +181,16 @@ def integrations_status() -> dict:
         "GEMINI_MODEL",
         "ENGINEER_GEMINI_MODEL",
         "JUDGE_GEMINI_MODEL",
+        "COMMS_LLM_PROVIDER",
+        "COMMS_OLLAMA_MODEL",
+        "COMMS_OPENROUTER_MODEL",
+        "COMMS_GROQ_MODEL",
+        "COMMS_GEMINI_MODEL",
+        "COMMS_OPENROUTER_API_KEY",
+        "COMMS_GROQ_API_KEY",
+        "COMMS_GEMINI_API_KEY",
+        "COMMS_LLM_TEMPERATURE",
+        "COMMS_LLM_MAX_TOKENS",
         "LANGSMITH_TRACING",
         "LANGSMITH_API_KEY",
         "LANGSMITH_PROJECT",
@@ -313,6 +325,10 @@ def ticket_story(ticket_id: str) -> TicketStoryResponse:
     summary = _ticket_summary(state)
     description = str(fields.get("description", state.jira_ticket.get("description", "")))
     risk_tier = state.manager_output.risk_tier.value if state.manager_output else None
+    artifacts = state.artifact_summary()
+    artifacts["patch_artifact_detail"] = (
+        state.patch_artifact.model_dump(mode="json") if state.patch_artifact is not None else None
+    )
     return TicketStoryResponse(
         ticket_id=ticket_id,
         run_id=state.run_id,
@@ -321,7 +337,7 @@ def ticket_story(ticket_id: str) -> TicketStoryResponse:
         description=description,
         risk_tier=risk_tier,
         assignee=_latest_assignee(ticket_id),
-        artifacts=state.artifact_summary(),
+        artifacts=artifacts,
         timeline=story_events,
     )
 
