@@ -21,6 +21,17 @@ export type StoryEvent = {
   deleted: boolean;
 };
 
+export type PatchArtifactDetail = {
+  format: string;
+  diff: string;
+  changed_files: string[];
+};
+
+export type TicketArtifacts = Record<string, unknown> & {
+  patch_artifact_detail?: PatchArtifactDetail | null;
+  patch_artifact?: Record<string, unknown> | boolean | null;
+};
+
 export type TicketStory = {
   ticket_id: string;
   run_id: string;
@@ -29,7 +40,7 @@ export type TicketStory = {
   description: string;
   risk_tier?: string | null;
   assignee?: string | null;
-  artifacts: Record<string, unknown>;
+  artifacts: TicketArtifacts;
   timeline: StoryEvent[];
 };
 
