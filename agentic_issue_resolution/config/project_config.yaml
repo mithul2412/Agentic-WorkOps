@@ -1,0 +1,55 @@
+output_format: unified_diff
+timezone: UTC
+
+risk_tiers:
+  low: standard
+  medium: standard
+  high: strict
+
+allowed_tools_by_role:
+  manager:
+    - jira_read
+    - bitbucket_search
+    - code_search
+    - tavily_search
+  engineer:
+    - file_read
+    - gemini_generate
+  auditor:
+    - patch_scope_verify
+    - risk_verify
+  finalizer:
+    - bitbucket_create_pr
+    - jira_comment
+    - confluence_draft
+    - calendar
+    - email
+
+max_files_editable: 3
+evidence_top_k: 5
+enable_tavily: true
+
+token_budgets:
+  manager_pack: 2500
+  engineer_pack: 3500
+  auditor_pack: 1200
+
+integrations:
+  jira_provider: mock
+  bitbucket_provider: mock
+  confluence_provider: mock
+  tavily_provider: mock
+  calendar_provider: google
+  email_provider: google
+
+apply_patch_after_approval: false
+
+operate:
+  enabled: true
+  selector_enabled_live: true
+
+autonomy:
+  min_confidence: 0.72
+
+demo:
+  force_ready_for_seeded_tickets: true

@@ -1,0 +1,12 @@
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.8.0
+eval_type_backport>=0.2.0
+PyYAML>=6.0.1
+langgraph>=0.2.0
+requests>=2.32.0
+python-dotenv>=1.0.1
+langsmith>=0.1.0
+google-api-python-client>=2.149.0
+google-auth>=2.35.0
+google-auth-oauthlib>=1.2.1
