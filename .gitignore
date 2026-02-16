@@ -3,6 +3,7 @@
 *.swp
 *.swo
 *.tmp
+TicketOps/
 .idea/
 .vscode/
 
