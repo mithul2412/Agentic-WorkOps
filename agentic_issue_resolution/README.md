@@ -8,12 +8,18 @@ FastAPI + LangGraph workflow that triages Jira issues, proposes patches, enforce
 2. Manager agent gathers evidence (Jira, Bitbucket, code search, Tavily) and decides:
    - `ASK_FOR_INFO`
    - `READY_TO_PATCH`
-3. Engineer agent generates a scoped patch artifact.
-4. Auditor checks schema/scope/risk and pauses at approval gate.
-5. `POST /approve` resumes:
-   - approved: create PR + Jira update + Confluence draft + calendar slots + Gmail draft
-   - rejected: add Jira rejection comment
-6. Operate module runs A/B experiments, judging, and live policy selection.
+3. If context is incomplete, workflow enters a human loop:
+   - posts Jira follow-up comment
+   - drafts follow-up email
+   - proposes meeting slots
+   - drafts Confluence notes
+   - communication content is LLM-generated with deterministic fallback
+4. Engineer agent generates a scoped patch artifact.
+5. Auditor checks schema/scope/risk and pauses at approval gate.
+6. `POST /approve` resumes:
+   - approved: create PR + Jira update + Confluence draft + calendar slots + Gmail draft (LLM-enhanced comms copy)
+   - rejected: add Jira rejection comment + draft human-loop comms artifacts
+7. Operate module runs A/B experiments, judging, and live policy selection.
 
 ## Runtime Architecture
 
@@ -27,11 +33,11 @@ FastAPI + LangGraph workflow that triages Jira issues, proposes patches, enforce
 ## Current Model Strategy
 
 - Manager:
-  - policy A: OpenRouter (`manager_or_fast_v1`)
-  - policy B: Groq (`manager_groq_v1`)
+  - policy A: Ollama local Qwen SFT (`manager_ollama_qwen25_sft_v1`)
+  - policy B: Ollama local Gemma2 (`manager_ollama_gemma2_local_v1`)
 - Engineer: Gemini direct API
 - Judge: Gemini/OpenRouter/Groq selectable
-- Manager runtime is API-policy only (no local model/heuristic fallback).
+- Manager runtime supports provider-based policies including local Ollama.
 
 ## Environment
 
@@ -41,6 +47,12 @@ Primary required groups:
 
 - Provider selectors:
   - `JIRA_PROVIDER`, `BITBUCKET_PROVIDER`, `CONFLUENCE_PROVIDER`, `TAVILY_PROVIDER`, `CALENDAR_PROVIDER`, `EMAIL_PROVIDER`
+- Ollama (manager):
+  - `OLLAMA_BASE_URL`, `MANAGER_OLLAMA_MODEL`
+- Comms LLM (human-loop drafting):
+  - `COMMS_LLM_PROVIDER` (`ollama|openrouter|groq|gemini`)
+  - `COMMS_OLLAMA_MODEL` (or provider-specific `COMMS_*_MODEL`)
+  - `COMMS_LLM_TEMPERATURE`, `COMMS_LLM_MAX_TOKENS`
 - OpenRouter:
   - `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `MANAGER_OPENROUTER_MODEL`, `JUDGE_OPENROUTER_MODEL`
 - Groq:
@@ -127,7 +139,7 @@ python agentic_issue_resolution/scripts/run_real_connected_demo.py \
   --report-path /Users/myth/Documents/VSCode/Codetor/agentic_issue_resolution/storage/real_connected_report.json
 ```
 
-### 4) Run API-only simulation batch
+### 4) Run simulation batch
 
 ```bash
 python agentic_issue_resolution/scripts/run_poc_simulation.py \

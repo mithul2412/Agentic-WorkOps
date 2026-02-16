@@ -208,6 +208,57 @@ class GeminiDirectClient:
         )
 
 
+class OllamaClient:
+    def __init__(
+        self,
+        default_model: str,
+        base_url: str | None = None,
+        timeout_seconds: int = 90,
+    ) -> None:
+        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+        self.default_model = default_model.strip()
+        self.timeout_seconds = timeout_seconds
+
+    @traceable(name="ollama_chat", run_type="llm")
+    def chat(self, request: LLMRequest, model: str | None = None) -> LLMResponse:
+        selected_model = (model or self.default_model).strip()
+        if not selected_model:
+            raise LLMProviderError("Ollama model is not configured")
+
+        options: dict[str, Any] = {
+            "temperature": request.temperature,
+        }
+        if request.max_tokens > 0:
+            options["num_predict"] = request.max_tokens
+
+        payload: dict[str, Any] = {
+            "model": selected_model,
+            "messages": _openai_messages(system=request.system, user=request.user),
+            "stream": False,
+            "options": options,
+        }
+        if request.expect_json:
+            payload["format"] = "json"
+
+        started = time.perf_counter()
+        response = requests.post(
+            f"{self.base_url}/api/chat",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = _extract_ollama_text(data)
+        return LLMResponse(
+            text=text,
+            provider="ollama",
+            model=selected_model,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            raw=data,
+        )
+
+
 def _openai_messages(system: str, user: str) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
     if system.strip():
@@ -256,3 +307,17 @@ def _extract_gemini_text(payload: dict[str, Any]) -> str:
     if not result:
         raise LLMProviderError("Gemini response content is empty")
     return result
+
+
+def _extract_ollama_text(payload: dict[str, Any]) -> str:
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+    response_text = payload.get("response")
+    if isinstance(response_text, str) and response_text.strip():
+        return response_text.strip()
+
+    raise LLMProviderError("Ollama response content is empty")

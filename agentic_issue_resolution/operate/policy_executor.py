@@ -13,6 +13,7 @@ from agentic_issue_resolution.tools.llm_provider import (
     GeminiDirectClient,
     GroqClient,
     LLMRequest,
+    OllamaClient,
     OpenRouterClient,
 )
 
@@ -39,6 +40,36 @@ Rules:
 - If decision == ASK_FOR_INFO, questions_needed must contain at least 1 item.
 - Always include all keys.
 """
+
+OLLAMA_SFT_SYSTEM_PROMPT = """You are a ticket triage manager model.
+Return ONLY one strict JSON object with no markdown and no extra text.
+Output schema (all keys always present):
+{
+  "decision": "ASK_FOR_INFO" | "READY_TO_PATCH",
+  "ticket_type": "bug" | "feature_update" | "feature_insert",
+  "risk_tier": "low" | "medium" | "high",
+  "ask_for_info_questions": string[],
+  "ready_to_patch_acceptance_criteria": string[]
+}
+Rules:
+- If decision == ASK_FOR_INFO, ready_to_patch_acceptance_criteria must be [].
+- If decision == READY_TO_PATCH, ask_for_info_questions must be [].
+- Never omit keys.
+"""
+
+VALID_DECISIONS = {"ASK_FOR_INFO", "READY_TO_PATCH"}
+VALID_TICKET_TYPES = {"bug", "feature_update", "feature_insert"}
+VALID_RISK_TIERS = {"low", "medium", "high"}
+
+DEFAULT_ASK_FOR_INFO_QUESTIONS = [
+    "What is the expected behavior and what is the actual behavior observed?",
+    "Please provide environment details (OS, runtime, and relevant package versions).",
+    "Can you attach relevant logs or a stack trace from the failing run?",
+]
+DEFAULT_READY_ACCEPTANCE = [
+    "The issue no longer reproduces after the patch with a clear validation path.",
+    "A regression test or equivalent automated check covers the fix behavior.",
+]
 
 
 @dataclass
@@ -80,9 +111,12 @@ class ManagerPolicyExecutor:
             try:
                 provider = policy.provider.strip().lower()
                 policy_type = policy.type.strip().lower()
-                if provider not in {"openrouter", "groq", "gemini"} and policy_type not in {"sota_api", "llm_api"}:
+                if provider not in {"openrouter", "groq", "gemini", "ollama"} and policy_type not in {
+                    "sota_api",
+                    "llm_api",
+                }:
                     raise RuntimeError(
-                        f"unsupported manager policy for API-only runtime: policy={policy.id} provider={provider} type={policy_type}"
+                        f"unsupported manager policy provider: policy={policy.id} provider={provider} type={policy_type}"
                     )
                 parsed, meta, raw = self._run_api_policy(policy, ticket_payload, evidence)
                 output = parsed.model_dump(mode="json")
@@ -136,22 +170,32 @@ class ManagerPolicyExecutor:
         if not model:
             raise RuntimeError(f"missing model configuration for policy {policy.id}")
 
-        prompt_payload = {
-            "ticket_id": ticket_payload.get("ticket_id", ""),
-            "project": ticket_payload.get("project", ""),
-            "title": ticket_payload.get("title", ""),
-            "description": ticket_payload.get("description", ""),
-            "comments": ticket_payload.get("comments", []),
-            "source": ticket_payload.get("source", "jira"),
-            "labels": ticket_payload.get("labels", []),
-            "mode": ticket_payload.get("mode", "incident"),
-            "team_profile": ticket_payload.get("team_profile", "platform"),
-            "evidence": evidence[:5],
-        }
+        if provider == "ollama":
+            prompt_payload = {
+                "title": self._clean_text(ticket_payload.get("title", "")),
+                "description": self._clean_text(ticket_payload.get("description", "")),
+                "comments": self._normalize_string_list(ticket_payload.get("comments", [])),
+            }
+            system_prompt = OLLAMA_SFT_SYSTEM_PROMPT
+        else:
+            prompt_payload = {
+                "ticket_id": ticket_payload.get("ticket_id", ""),
+                "project": ticket_payload.get("project", ""),
+                "title": ticket_payload.get("title", ""),
+                "description": ticket_payload.get("description", ""),
+                "comments": ticket_payload.get("comments", []),
+                "source": ticket_payload.get("source", "jira"),
+                "labels": ticket_payload.get("labels", []),
+                "mode": ticket_payload.get("mode", "incident"),
+                "team_profile": ticket_payload.get("team_profile", "platform"),
+                "evidence": evidence[:5],
+            }
+            system_prompt = SYSTEM_PROMPT
+
         client = self._provider_client(policy=policy, provider=provider, model=model)
         response = client.chat(
             LLMRequest(
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 user=json.dumps(prompt_payload, ensure_ascii=False),
                 temperature=policy.temperature,
                 max_tokens=policy.max_new_tokens,
@@ -160,11 +204,18 @@ class ManagerPolicyExecutor:
             model=model,
         )
         raw = response.text
-        parsed = ManagerOutput.model_validate(json.loads(self._extract_first_json(raw)))
+        extracted = json.loads(self._extract_first_json(raw))
+        if provider == "ollama":
+            normalized = self._normalize_ollama_output(raw_output=extracted, ticket_payload=ticket_payload)
+            parsed = ManagerOutput.model_validate(normalized)
+        else:
+            parsed = ManagerOutput.model_validate(extracted)
+
+        mode = "local_ollama" if provider == "ollama" else "sota_api"
         reason = (
             f"provider={response.provider};model={response.model};latency_ms={response.latency_ms};policy={policy.id}"
         )
-        return parsed, {"mode": "sota_api", "reason": reason}, raw
+        return parsed, {"mode": mode, "reason": reason}, raw
 
     def _provider_client(self, policy: PolicyDefinition, provider: str, model: str):
         if provider == "openrouter":
@@ -182,6 +233,10 @@ class ManagerPolicyExecutor:
             base_url = os.getenv(policy.base_url_env or "GEMINI_API_BASE", "").strip() or None
             return GeminiDirectClient(api_key=api_key, default_model=model, base_url=base_url)
 
+        if provider == "ollama":
+            base_url = os.getenv(policy.base_url_env or "OLLAMA_BASE_URL", "").strip() or None
+            return OllamaClient(default_model=model, base_url=base_url)
+
         raise RuntimeError(f"unsupported manager policy provider: {provider}")
 
     def _resolve_model(self, provider: str, model_env: str | None, default: str) -> str:
@@ -198,6 +253,140 @@ class ManagerPolicyExecutor:
             if value:
                 return value
         return default.strip()
+
+    def _normalize_ollama_output(
+        self,
+        raw_output: dict[str, Any],
+        ticket_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        decision = self._normalize_decision(raw_output.get("decision"))
+        ticket_type = self._normalize_ticket_type(raw_output)
+        risk_tier = self._normalize_risk_tier(raw_output.get("risk_tier"))
+
+        ask_questions = self._normalize_string_list(raw_output.get("ask_for_info_questions"))
+        if not ask_questions:
+            ask_questions = self._normalize_string_list(raw_output.get("questions_needed"))
+
+        ready_acceptance = self._normalize_string_list(raw_output.get("ready_to_patch_acceptance_criteria"))
+        coding_brief = raw_output.get("coding_brief")
+        if not ready_acceptance and isinstance(coding_brief, dict):
+            ready_acceptance = self._normalize_string_list(coding_brief.get("acceptance_criteria"))
+
+        if decision == "ASK_FOR_INFO":
+            ready_acceptance = []
+            if not ask_questions:
+                ask_questions = list(DEFAULT_ASK_FOR_INFO_QUESTIONS)
+        else:
+            ask_questions = []
+            if not ready_acceptance:
+                ready_acceptance = list(DEFAULT_READY_ACCEPTANCE)
+
+        summary = self._clean_text(raw_output.get("summary"))
+        if not summary:
+            summary = self._derive_summary(ticket_payload)
+
+        error_signature = self._clean_text(raw_output.get("error_signature")) or "NONE_PROVIDED"
+        suspected_components = self._normalize_string_list(raw_output.get("suspected_components"))
+
+        suspected_files: list[str] = []
+        hypothesis = ""
+        if isinstance(coding_brief, dict):
+            suspected_files = self._normalize_string_list(coding_brief.get("suspected_files"))
+            hypothesis = self._clean_text(coding_brief.get("hypothesis"))
+        if not hypothesis:
+            hypothesis = self._derive_hypothesis(ticket_payload)
+
+        return {
+            "decision": decision,
+            "ticket_type": ticket_type,
+            "risk_tier": risk_tier,
+            "summary": summary,
+            "error_signature": error_signature,
+            "suspected_components": suspected_components,
+            "questions_needed": ask_questions,
+            "coding_brief": {
+                "suspected_files": suspected_files,
+                "hypothesis": hypothesis,
+                "acceptance_criteria": ready_acceptance,
+            },
+        }
+
+    def _normalize_decision(self, value: Any) -> str:
+        text = self._clean_text(value).upper()
+        return text if text in VALID_DECISIONS else "ASK_FOR_INFO"
+
+    def _normalize_ticket_type(self, raw_output: dict[str, Any]) -> str:
+        text = self._clean_text(raw_output.get("ticket_type")).lower()
+        if text in VALID_TICKET_TYPES:
+            return text
+
+        feature_insert = raw_output.get("feature_insert")
+        feature_update = raw_output.get("feature_update")
+        if self._truthy_signal(feature_insert):
+            return "feature_insert"
+        if self._truthy_signal(feature_update):
+            return "feature_update"
+        return "bug"
+
+    def _normalize_risk_tier(self, value: Any) -> str:
+        text = self._clean_text(value).lower()
+        return text if text in VALID_RISK_TIERS else "low"
+
+    def _normalize_string_list(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [self._clean_text(item) for item in value if self._clean_text(item)]
+        if isinstance(value, tuple):
+            return [self._clean_text(item) for item in value if self._clean_text(item)]
+        if isinstance(value, str):
+            text = self._clean_text(value)
+            if not text:
+                return []
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        return [self._clean_text(item) for item in parsed if self._clean_text(item)]
+                except Exception:
+                    pass
+            return [text]
+        return []
+
+    def _derive_summary(self, ticket_payload: dict[str, Any]) -> str:
+        title = self._clean_text(ticket_payload.get("title", ""))
+        description = self._clean_text(ticket_payload.get("description", ""))
+        if title:
+            return title[:200]
+        if description:
+            return description[:200]
+        return "Ticket triage summary generated from available context."
+
+    def _derive_hypothesis(self, ticket_payload: dict[str, Any]) -> str:
+        title = self._clean_text(ticket_payload.get("title", ""))
+        if title:
+            return f"Likely localized issue related to: {title[:120]}."
+        return "Likely localized issue based on provided ticket context."
+
+    def _clean_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return text
+
+    def _truthy_signal(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized not in {"", "none", "null", "false", "0"}
+        if isinstance(value, (list, tuple, dict)):
+            return len(value) > 0
+        return True
 
     def _extract_first_json(self, text: str) -> str:
         start = text.find("{")
