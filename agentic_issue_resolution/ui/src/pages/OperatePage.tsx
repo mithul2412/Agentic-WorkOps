@@ -7,9 +7,9 @@ export default function OperatePage() {
   const [source, setSource] = useState("tasks_json");
   const [tasksPath, setTasksPath] = useState("/Users/myth/Documents/VSCode/Codetor/agentic_issue_resolution/samples/tasks.json");
   const [ticketIdsText, setTicketIdsText] = useState("ENG-123");
-  const [policyA, setPolicyA] = useState("manager_or_fast_v1");
-  const [policyB, setPolicyB] = useState("manager_groq_v1");
-  const [judgePolicy, setJudgePolicy] = useState("judge_gemini_v1");
+  const [policyA, setPolicyA] = useState("manager_ollama_qwen25_sft_v1");
+  const [policyB, setPolicyB] = useState("manager_ollama_gemma2_local_v1");
+  const [judgePolicy, setJudgePolicy] = useState("judge_groq_v1");
   const [maxTasks, setMaxTasks] = useState("10");
   const [seed, setSeed] = useState("42");
   const [runResponse, setRunResponse] = useState<OperateRunResponse | null>(null);

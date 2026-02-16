@@ -1,8 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { getMetricsSummary, getModelOpsSummary, listTickets } from "../api";
-import type { MetricsSummary, ModelOpsSummary, TicketListItem } from "../types";
+import { getFlow, getMetricsSummary, getModelOpsSummary, getTicketStory, listTickets } from "../api";
+import FlowLine from "../components/FlowLine";
+import type { FlowSnapshot, MetricsSummary, ModelOpsSummary, StoryEvent, TicketListItem, TicketStory } from "../types";
+
+function asPercent(value: number | null): string {
+  if (value === null) return "n/a";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function previewPayload(payload: Record<string, unknown>): string {
+  const text = JSON.stringify(payload);
+  if (!text) return "{}";
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
 
 export default function DashboardPage() {
   const [tickets, setTickets] = useState<TicketListItem[]>([]);
@@ -12,17 +24,47 @@ export default function DashboardPage() {
   const [metrics, setMetrics] = useState<MetricsSummary | null>(null);
   const [modelOps, setModelOps] = useState<ModelOpsSummary | null>(null);
 
-  useEffect(() => {
+  const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null);
+  const [selectedStory, setSelectedStory] = useState<TicketStory | null>(null);
+  const [selectedFlow, setSelectedFlow] = useState<FlowSnapshot | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+
+  const loadBoard = async () => {
     setLoading(true);
-    Promise.all([listTickets(), getMetricsSummary(), getModelOpsSummary()])
-      .then(([rows, metricsSummary, modelOpsSummary]) => {
-        setTickets(rows);
-        setMetrics(metricsSummary);
-        setModelOps(modelOpsSummary);
-        setError(null);
-      })
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
+    try {
+      const [rows, metricsSummary, modelOpsSummary] = await Promise.all([
+        listTickets(),
+        getMetricsSummary(),
+        getModelOpsSummary()
+      ]);
+      setTickets(rows);
+      setMetrics(metricsSummary);
+      setModelOps(modelOpsSummary);
+      setError(null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadTicketDetail = async (ticketId: string) => {
+    setDetailLoading(true);
+    setDetailError(null);
+    try {
+      const [storyData, flowData] = await Promise.all([getTicketStory(ticketId), getFlow(ticketId)]);
+      setSelectedStory(storyData);
+      setSelectedFlow(flowData);
+    } catch (err) {
+      setDetailError((err as Error).message);
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadBoard();
   }, []);
 
   const filtered = useMemo(() => {
@@ -33,128 +75,240 @@ export default function DashboardPage() {
         ticket.ticket_id.toLowerCase().includes(q) ||
         ticket.summary.toLowerCase().includes(q) ||
         String(ticket.status).toLowerCase().includes(q) ||
+        String(ticket.current_step).toLowerCase().includes(q) ||
         (ticket.assignee || "").toLowerCase().includes(q)
     );
   }, [tickets, query]);
 
+  useEffect(() => {
+    if (!filtered.length) {
+      setSelectedTicketId(null);
+      setSelectedStory(null);
+      setSelectedFlow(null);
+      return;
+    }
+    const hasSelection = selectedTicketId ? filtered.some((row) => row.ticket_id === selectedTicketId) : false;
+    if (!hasSelection) {
+      setSelectedTicketId(filtered[0].ticket_id);
+    }
+  }, [filtered, selectedTicketId]);
+
+  useEffect(() => {
+    if (!selectedTicketId) return;
+    void loadTicketDetail(selectedTicketId);
+  }, [selectedTicketId]);
+
+  const selectedTicket = useMemo(
+    () => (selectedTicketId ? tickets.find((row) => row.ticket_id === selectedTicketId) || null : null),
+    [tickets, selectedTicketId]
+  );
+
+  const recentEvents = useMemo<StoryEvent[]>(() => {
+    if (!selectedStory) return [];
+    return [...selectedStory.timeline].slice(-12).reverse();
+  }, [selectedStory]);
+
+  const refreshAll = () => {
+    void loadBoard();
+    if (selectedTicketId) {
+      void loadTicketDetail(selectedTicketId);
+    }
+  };
+
+  const totalTickets = metrics?.totals.tickets ?? tickets.length;
+  const completedTickets = metrics?.totals.completed_tickets ?? tickets.filter((row) => row.status === "COMPLETED").length;
+  const avgCycle = metrics?.triage_to_fix_cycle_time.avg_minutes ?? null;
+  const reopenRate = metrics?.reopen_regression_rate.rate ?? null;
+  const fallbackRate = modelOps?.manager.fallback_rate ?? null;
+  const explorationRate = modelOps?.selector.exploration_rate ?? null;
+
   return (
-    <section>
-      <header className="page-header">
-        <h2>Office Ticket Board</h2>
-        <p>Track every ticket story from intake to merge and knowledge update.</p>
+    <section className="command-center">
+      <header className="page-header command-header">
+        <div>
+          <h2>Ticket Command Center</h2>
+          <p>Track stage progression, recent events, and current state for every ticket in one screen.</p>
+        </div>
+        <button className="btn subtle" onClick={refreshAll} disabled={loading || detailLoading}>
+          {loading || detailLoading ? "Refreshing..." : "Refresh"}
+        </button>
       </header>
 
-      <div className="card">
-        <label className="label">Search tickets</label>
-        <input
-          className="input"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Filter by ID, summary, status, assignee"
-        />
+      <div className="card compact-card board-top-strip">
+        <div className="board-search-wrap">
+          <label className="label" htmlFor="ticket-search">
+            Search tickets
+          </label>
+          <input
+            id="ticket-search"
+            className="input"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="ID, summary, status, stage, assignee"
+          />
+          <p className="meta-line">Showing {filtered.length} of {tickets.length} tickets</p>
+        </div>
+
+        <div className="kpi-strip">
+          <div className="kpi-chip">
+            <span>Tickets</span>
+            <strong>{totalTickets}</strong>
+          </div>
+          <div className="kpi-chip">
+            <span>Completed</span>
+            <strong>{completedTickets}</strong>
+          </div>
+          <div className="kpi-chip">
+            <span>Avg Cycle</span>
+            <strong>{avgCycle === null ? "n/a" : `${avgCycle.toFixed(1)}m`}</strong>
+          </div>
+          <div className="kpi-chip">
+            <span>Reopen Rate</span>
+            <strong>{asPercent(reopenRate)}</strong>
+          </div>
+          <div className="kpi-chip">
+            <span>Fallback</span>
+            <strong>{asPercent(fallbackRate)}</strong>
+          </div>
+          <div className="kpi-chip">
+            <span>Exploration</span>
+            <strong>{asPercent(explorationRate)}</strong>
+          </div>
+        </div>
       </div>
 
-      {loading && <p>Loading tickets...</p>}
-      {error && <p className="error-text">{error}</p>}
-      {metrics && (
-        <div className="card">
-          <h3>Business Metrics Snapshot</h3>
-          <p className="meta-line">
-            Tickets: {metrics.totals.tickets} | Completed: {metrics.totals.completed_tickets}
-          </p>
-          <p className="meta-line">
-            Cycle time avg/p50/p90 (min): {metrics.triage_to_fix_cycle_time.avg_minutes} /{" "}
-            {metrics.triage_to_fix_cycle_time.p50_minutes} / {metrics.triage_to_fix_cycle_time.p90_minutes}
-          </p>
-          <p className="meta-line">
-            Reopen/regression rate: {(metrics.reopen_regression_rate.rate * 100).toFixed(1)}%
-          </p>
-          <p className="meta-line">Handoff quality score: {(metrics.handoff_quality.avg_score * 100).toFixed(1)}%</p>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Team</th>
-                  <th>Best Policy</th>
-                  <th>Win Rate</th>
-                  <th>Samples</th>
-                </tr>
-              </thead>
-              <tbody>
-                {metrics.policy_win_rate_by_team.map((row) => (
-                  <tr key={row.team_profile}>
-                    <td>{row.team_profile}</td>
-                    <td>{row.best_policy}</td>
-                    <td>{(row.win_rate * 100).toFixed(1)}%</td>
-                    <td>{row.sample_size}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      <div className="board-grid">
+        <section className="card board-pane">
+          <div className="board-pane-header">
+            <h3>Ticket Board</h3>
+            <span className="meta-line">{loading ? "Loading..." : `${filtered.length} rows`}</span>
           </div>
-        </div>
-      )}
-      {modelOps && (
-        <div className="card">
-          <h3>Model Ops Snapshot</h3>
-          <p className="meta-line">
-            Manager fallback rate: {(modelOps.manager.fallback_rate * 100).toFixed(1)}% ({modelOps.manager.fallback_decisions}/
-            {modelOps.manager.decisions})
-          </p>
-          <p className="meta-line">
-            Selector exploration rate: {(modelOps.selector.exploration_rate * 100).toFixed(1)}% ({modelOps.selector.explored_count}/
-            {modelOps.selector.total_live_decisions})
-          </p>
-          <p className="meta-line">
-            Judge confidence avg/p50/p90: {modelOps.judge_confidence.avg.toFixed(2)} / {modelOps.judge_confidence.p50.toFixed(2)} /{" "}
-            {modelOps.judge_confidence.p90.toFixed(2)}
-          </p>
-          <p className="meta-line">
-            Low-confidence skipped updates: {(modelOps.judge_confidence.low_confidence_skip_rate * 100).toFixed(1)}% (
-            {modelOps.judge_confidence.skipped_low_confidence})
-          </p>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Policy</th>
-                  <th>Provider</th>
-                  <th>Avg Runtime</th>
-                  <th>Avg Cost</th>
-                  <th>Samples</th>
-                </tr>
-              </thead>
-              <tbody>
-                {modelOps.policy_runtime_cost.map((row) => (
-                  <tr key={row.policy_id}>
-                    <td>{row.policy_id}</td>
-                    <td>{row.provider}</td>
-                    <td>{row.avg_runtime_ms.toFixed(1)} ms</td>
-                    <td>{row.avg_cost_proxy.toFixed(6)}</td>
-                    <td>{row.sample_size}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
 
-      <div className="ticket-grid">
-        {filtered.map((ticket) => (
-          <Link to={`/tickets/${ticket.ticket_id}`} key={ticket.ticket_id} className="ticket-card">
-            <div className="ticket-card-top">
-              <span className="pill">{ticket.status}</span>
-              <span className="mono">{ticket.ticket_id}</span>
+          <div className="board-ticket-table-wrap">
+            <table className="board-ticket-table">
+              <thead>
+                <tr>
+                  <th>Ticket</th>
+                  <th>Status</th>
+                  <th>Stage</th>
+                  <th>Risk</th>
+                  <th>Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((ticket) => (
+                  <tr
+                    key={ticket.ticket_id}
+                    className={selectedTicketId === ticket.ticket_id ? "board-row-selected" : ""}
+                    onClick={() => setSelectedTicketId(ticket.ticket_id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedTicketId(ticket.ticket_id);
+                      }
+                    }}
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`Open ${ticket.ticket_id}`}
+                  >
+                    <td>
+                      <div className="board-ticket-id mono">{ticket.ticket_id}</div>
+                      <div className="board-ticket-summary">{ticket.summary}</div>
+                    </td>
+                    <td>
+                      <span className="pill board-ticket-status">{ticket.status}</span>
+                    </td>
+                    <td className="mono">{ticket.current_step}</td>
+                    <td>{ticket.risk_tier || "n/a"}</td>
+                    <td>{new Date(ticket.updated_at).toLocaleString()}</td>
+                  </tr>
+                ))}
+
+                {!loading && filtered.length === 0 ? (
+                  <tr>
+                    <td className="empty-row" colSpan={5}>
+                      No tickets matched your filter.
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card board-pane ticket-detail-pane">
+          <div className="board-pane-header">
+            <div>
+              <h3>{selectedTicket ? selectedTicket.ticket_id : "Ticket Details"}</h3>
+              <p className="meta-line">{selectedTicket?.summary || "Select a ticket from the board."}</p>
             </div>
-            <h3>{ticket.summary}</h3>
-            <p className="meta-line">Step: {ticket.current_step}</p>
-            <p className="meta-line">Risk: {ticket.risk_tier || "n/a"}</p>
-            <p className="meta-line">Assignee: {ticket.assignee || "unassigned"}</p>
-            <p className="meta-line">Updated: {new Date(ticket.updated_at).toLocaleString()}</p>
-          </Link>
-        ))}
+            {selectedTicket ? (
+              <Link className="btn subtle" to={`/tickets/${selectedTicket.ticket_id}`}>
+                Open Full Ticket
+              </Link>
+            ) : null}
+          </div>
+
+          {selectedTicket ? (
+            <>
+              <div className="detail-meta-grid">
+                <div className="detail-meta-item">
+                  <span>Status</span>
+                  <strong>{selectedTicket.status}</strong>
+                </div>
+                <div className="detail-meta-item">
+                  <span>Stage</span>
+                  <strong>{selectedTicket.current_step}</strong>
+                </div>
+                <div className="detail-meta-item">
+                  <span>Risk</span>
+                  <strong>{selectedTicket.risk_tier || "n/a"}</strong>
+                </div>
+                <div className="detail-meta-item">
+                  <span>Assignee</span>
+                  <strong>{selectedTicket.assignee || "unassigned"}</strong>
+                </div>
+              </div>
+
+              <div className="detail-flow-wrap">
+                <FlowLine flow={selectedFlow} compact />
+              </div>
+
+              <div className="detail-events-head">
+                <h4>Recent Events</h4>
+                <span className="meta-line">
+                  {detailLoading ? "Refreshing..." : `Last update: ${new Date(selectedTicket.updated_at).toLocaleString()}`}
+                </span>
+              </div>
+
+              {detailError ? <p className="error-text">{detailError}</p> : null}
+
+              <div className="recent-events">
+                {recentEvents.length ? (
+                  recentEvents.map((event) => (
+                    <article key={event.event_id} className="recent-event">
+                      <div className="recent-event-head">
+                        <span className="pill">{event.source}</span>
+                        <span className="event-kind mono">{event.kind}</span>
+                      </div>
+                      <p className="meta-line">
+                        {new Date(event.ts).toLocaleString()} · {event.actor || "system"} · {event.team || "general"}
+                      </p>
+                      <p className="event-preview mono">{previewPayload(event.payload)}</p>
+                    </article>
+                  ))
+                ) : (
+                  <p className="meta-line">No timeline events yet.</p>
+                )}
+              </div>
+            </>
+          ) : (
+            <p className="meta-line">No ticket selected.</p>
+          )}
+        </section>
       </div>
+
+      {error ? <p className="error-text">{error}</p> : null}
     </section>
   );
 }
