@@ -4,6 +4,8 @@
 *.swo
 *.tmp
 TicketOps/
+.idea/
+.vscode/
 
 # Python cache / virtualenv
 __pycache__/
@@ -11,10 +13,17 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
 
 # Node artifacts
 node_modules/
 dist/
+*.log
 
 # Env and secrets
 .env
@@ -44,6 +53,8 @@ agentic_issue_resolution/ui/tsconfig.tsbuildinfo
 /data/
 /models/
 /*.parquet
+/*.feather
+/*.arrow
 
 # SFT / finetuning artifacts (excluded for now)
 scripts/finetuning/

@@ -54,6 +54,27 @@ python3 scripts/dataextractioncuration/04_make_review_pack.py \
   --ticket_type_targets bug=0.70,feature_update=0.20,feature_insert=0.10
 ```
 
+Post-curation SFT data prep (strict manager JSON contract):
+
+```bash
+python3 scripts/finetuning/prepare_manager_sft_dataset.py \
+  --in_file /Users/myth/Documents/VSCode/Codetor/data/curated/triage_curated_v1_3k.parquet \
+  --out_dir /Users/myth/Documents/VSCode/Codetor/data/sft \
+  --seed 42 \
+  --train_ratio 0.90 \
+  --val_ratio 0.05 \
+  --test_ratio 0.05 \
+  --profiles gemma2_2b,qwen25_3b \
+  --min_label_confidence none
+```
+
+```bash
+python3 scripts/finetuning/validate_manager_sft_dataset.py \
+  --out_dir /Users/myth/Documents/VSCode/Codetor/data/sft \
+  --profiles gemma2_2b,qwen25_3b \
+  --splits train,val,test,all
+```
+
 ## Expected Artifacts
 
 - `data/raw/swebench.parquet`

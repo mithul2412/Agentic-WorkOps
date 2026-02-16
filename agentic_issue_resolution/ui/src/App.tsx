@@ -4,34 +4,39 @@ import TicketStoryPage from "./pages/TicketStoryPage";
 import OperatePage from "./pages/OperatePage";
 import SelectorPage from "./pages/SelectorPage";
 
-const NAV_ITEMS = [
-  { to: "/", label: "Ticket Board" },
-  { to: "/operate", label: "Operate A/B" },
-  { to: "/selector", label: "Policy Selector" }
-];
-
 export default function App() {
   const location = useLocation();
+  const isBoard = location.pathname === "/";
+
   return (
     <div className="app-shell">
-      <aside className="side-nav">
-        <div className="brand">
-          <h1>StoryOps</h1>
-          <p>Ticket narrative and policy control center</p>
+      <header className="top-nav">
+        <div className="top-brand-wrap">
+          <Link to="/" className="top-brand-link">
+            StoryOps
+          </Link>
+          <p className="top-subtitle">Ticket command center</p>
         </div>
-        <nav>
-          {NAV_ITEMS.map((item) => (
-            <Link
-              key={item.to}
-              className={`nav-link ${location.pathname === item.to ? "active" : ""}`}
-              to={item.to}
-            >
-              {item.label}
-            </Link>
-          ))}
+
+        <nav className="top-actions" aria-label="Primary actions">
+          <Link
+            to="/operate"
+            className={`top-action-btn ${location.pathname.startsWith("/operate") ? "active" : ""}`}
+            data-tooltip="Run and compare manager policies"
+          >
+            Operate A/B
+          </Link>
+          <Link
+            to="/selector"
+            className={`top-action-btn ${location.pathname.startsWith("/selector") ? "active" : ""}`}
+            data-tooltip="Inspect/monitor policy win-rates and category routing"
+          >
+            Policy Selector
+          </Link>
         </nav>
-      </aside>
-      <main className="main-view">
+      </header>
+
+      <main className={`main-view ${isBoard ? "main-view-board" : ""}`}>
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/tickets/:ticketId" element={<TicketStoryPage />} />

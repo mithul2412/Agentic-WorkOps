@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import sys
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from pathlib import Path
 
 import yaml
@@ -52,46 +54,86 @@ def _path_from_env(key: str) -> Path | None:
 
 
 def _check_manager(failures: list[str], warnings: list[str]) -> None:
-    providers = _active_manager_providers()
-    if not providers:
+    active_policies = _active_manager_policies()
+    if not active_policies:
         failures.append(
-            "No active manager providers found. Ensure config/manager_policies.yaml has API policies (openrouter/groq/gemini)."
+            "No active manager providers found. Ensure config/manager_policies.yaml has manager policies (ollama/openrouter/groq/gemini)."
         )
         return
 
-    unsupported = sorted(provider for provider in providers if provider not in {"openrouter", "groq", "gemini"})
+    providers = sorted({policy.get("provider", "") for policy in active_policies})
+    unsupported = sorted(provider for provider in providers if provider not in {"openrouter", "groq", "gemini", "ollama"})
     if unsupported:
         failures.append(
-            "Unsupported manager providers in API-only runtime: "
+            "Unsupported manager providers in runtime: "
             + ", ".join(unsupported)
-            + ". Use openrouter/groq/gemini policies."
+            + ". Use ollama/openrouter/groq/gemini policies."
         )
         return
 
-    provider_keys_ready = {
+    provider_api_ready = {
         "openrouter": _is_set("OPENROUTER_API_KEY"),
         "groq": _is_set("GROQ_API_KEY"),
         "gemini": _is_set("GEMINI_API_KEY") or _is_set("GOOGLE_API_KEY"),
     }
-    if "openrouter" in providers and not provider_keys_ready["openrouter"]:
+    if "openrouter" in providers and not provider_api_ready["openrouter"]:
         warnings.append("OPENROUTER_API_KEY is missing; OpenRouter manager policies will be skipped.")
-    if "groq" in providers and not provider_keys_ready["groq"]:
+    if "groq" in providers and not provider_api_ready["groq"]:
         warnings.append("GROQ_API_KEY is missing; Groq manager policies will be skipped.")
-    if "gemini" in providers and not provider_keys_ready["gemini"]:
+    if "gemini" in providers and not provider_api_ready["gemini"]:
         warnings.append("GEMINI_API_KEY/GOOGLE_API_KEY is missing; Gemini manager policies will be skipped.")
 
-    if not any(provider_keys_ready.get(provider, False) for provider in providers):
-        failures.append("No API key configured for active manager policies (OpenRouter/Groq/Gemini).")
+    ollama_ready = False
+    if "ollama" in providers:
+        model_missing_ids: list[str] = []
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+        for policy in active_policies:
+            if policy.get("provider") != "ollama":
+                continue
+            model_env = str(policy.get("model_env", "")).strip()
+            model_default = str(policy.get("model_default", "")).strip()
+            model_name = os.getenv(model_env, "").strip() if model_env else ""
+            if not model_name:
+                model_name = model_default
+            if not model_name:
+                model_missing_ids.append(str(policy.get("id", "unknown")))
+
+            base_url_env = str(policy.get("base_url_env", "")).strip()
+            if base_url_env:
+                configured = os.getenv(base_url_env, "").strip()
+                if configured:
+                    base_url = configured
+
+        if model_missing_ids:
+            failures.append(
+                "Ollama manager policies missing model configuration for: " + ", ".join(model_missing_ids)
+            )
+        else:
+            health_url = f"{base_url.rstrip('/')}/api/tags"
+            try:
+                req = urlrequest.Request(health_url, method="GET")
+                with urlrequest.urlopen(req, timeout=5) as resp:  # noqa: S310
+                    if resp.status >= 400:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                ollama_ready = True
+            except (urlerror.URLError, RuntimeError) as exc:
+                failures.append(f"Ollama manager provider is configured but unreachable at {health_url}: {exc}")
+
+    has_ready_provider = ollama_ready or any(provider_api_ready.get(provider, False) for provider in providers)
+    if not has_ready_provider:
+        failures.append(
+            "No active manager provider is ready. Configure reachable Ollama and/or API credentials for OpenRouter/Groq/Gemini."
+        )
 
 
-def _active_manager_providers() -> set[str]:
+def _active_manager_policies() -> list[dict[str, str]]:
     if not POLICY_FILE.exists():
-        return set()
+        return []
     loaded = yaml.safe_load(POLICY_FILE.read_text(encoding="utf-8")) or {}
     if not isinstance(loaded, dict):
-        return set()
+        return []
 
-    policies = {}
+    policies: dict[str, dict[str, str]] = {}
     for row in loaded.get("policies", []):
         if not isinstance(row, dict):
             continue
@@ -105,7 +147,13 @@ def _active_manager_providers() -> set[str]:
                 provider = "openrouter"
             else:
                 provider = "unknown"
-        policies[policy_id] = provider
+        policies[policy_id] = {
+            "id": policy_id,
+            "provider": provider,
+            "model_env": str(row.get("model_env", "")).strip(),
+            "model_default": str(row.get("model_default", "")).strip(),
+            "base_url_env": str(row.get("base_url_env", "")).strip(),
+        }
 
     selector = loaded.get("selector", {}) if isinstance(loaded.get("selector"), dict) else {}
     active_ids = []
@@ -119,12 +167,12 @@ def _active_manager_providers() -> set[str]:
     if not active_ids:
         active_ids = list(policies.keys())
 
-    active_providers: set[str] = set()
+    active_policies: list[dict[str, str]] = []
     for policy_id in active_ids:
-        provider = policies.get(policy_id)
-        if provider:
-            active_providers.add(provider)
-    return active_providers
+        policy = policies.get(policy_id)
+        if policy:
+            active_policies.append(policy)
+    return active_policies
 
 
 def _check_jira(failures: list[str]) -> None:
