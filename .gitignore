@@ -4,6 +4,7 @@
 *.swo
 *.tmp
 TicketOps/
+agentic_issue_resolution/
 .idea/
 .vscode/
 
@@ -32,22 +33,22 @@ dist/
 *.pem
 *.key
 *.crt
-!agentic_issue_resolution/.env.example
+!.env.example
 
 # Local OAuth / credentials / tokens
-agentic_issue_resolution/client_secret_*.json
-agentic_issue_resolution/storage/google_token.json
+client_secret_*.json
+storage/google_token.json
 
 # Runtime outputs / reports / local DB
-agentic_issue_resolution/storage/*.db
-agentic_issue_resolution/storage/*.json
-!agentic_issue_resolution/storage/__init__.py
-!agentic_issue_resolution/storage/sqlite_store.py
+storage/*.db
+storage/*.json
+!storage/__init__.py
+!storage/sqlite_store.py
 
 # App build artifacts
-agentic_issue_resolution/ui/node_modules/
-agentic_issue_resolution/ui/dist/
-agentic_issue_resolution/ui/tsconfig.tsbuildinfo
+ui/node_modules/
+ui/dist/
+ui/tsconfig.tsbuildinfo
 
 # Project-level generated data / model artifacts
 /data/
@@ -58,10 +59,10 @@ agentic_issue_resolution/ui/tsconfig.tsbuildinfo
 
 # SFT / finetuning artifacts (excluded for now)
 scripts/finetuning/
-agentic_issue_resolution/tools/manager_sft.py
+tools/manager_sft.py
 
 # Root npm lock not part of this project structure
 /package-lock.json
 
 # Keep reproducible demo samples
-!agentic_issue_resolution/samples/*.json
+!samples/*.json
