@@ -3,6 +3,7 @@
 *.swp
 *.swo
 *.tmp
+TicketOps/
 
 # Python cache / virtualenv
 __pycache__/
@@ -42,6 +43,7 @@ agentic_issue_resolution/ui/tsconfig.tsbuildinfo
 # Project-level generated data / model artifacts
 /data/
 /models/
+/*.parquet
 
 # SFT / finetuning artifacts (excluded for now)
 scripts/finetuning/
