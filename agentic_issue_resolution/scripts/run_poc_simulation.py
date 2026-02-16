@@ -203,8 +203,8 @@ def main() -> int:
             {
                 "source": "tasks_json",
                 "tasks_path": str(args.tasks_path),
-                "policy_a_id": "manager_or_fast_v1",
-                "policy_b_id": "manager_groq_v1",
+                "policy_a_id": "manager_ollama_qwen25_sft_v1",
+                "policy_b_id": "manager_ollama_gemma2_local_v1",
                 "max_tasks": len(tasks),
                 "seed": 42,
             },
@@ -217,7 +217,7 @@ def main() -> int:
                 args.timeout,
                 {
                     "ab_run_id": ab_run_id,
-                    "judge_policy_id": "judge_gemini_v1",
+                    "judge_policy_id": "judge_groq_v1",
                     "category_key": "team_profile|ticket_type|risk_tier",
                 },
             )
