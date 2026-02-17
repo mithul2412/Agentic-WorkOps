@@ -19,7 +19,8 @@ FastAPI + LangGraph workflow that triages Jira issues, proposes patches, enforce
 6. `POST /approve` resumes:
    - approved: create PR + Jira update + Confluence draft + calendar slots + Gmail draft (LLM-enhanced comms copy)
    - rejected: add Jira rejection comment + draft human-loop comms artifacts
-7. Operate module runs A/B experiments, judging, and live policy selection.
+   - Composer helps in this stage for drafting docs, mail, and creating meeting links by checking availablility
+7. Operate module runs A/B experiments, RLAIF judging, and live policy selection.
 
 ## Runtime Architecture
 
@@ -37,6 +38,7 @@ FastAPI + LangGraph workflow that triages Jira issues, proposes patches, enforce
   - policy B: Ollama local Gemma2 (`manager_ollama_gemma2_local_v1`)
 - Engineer: Gemini direct API
 - Judge: Gemini/OpenRouter/Groq selectable
+- Composer: Gemini/OpenRouter/Groq selectable
 - Manager runtime supports provider-based policies including local Ollama.
 
 ## Environment
@@ -152,4 +154,4 @@ python scripts/run_poc_simulation.py \
 
 - Approval resumes are resilient to app restarts: if in-memory graph checkpoints are missing, workflow continues from persisted DB state.
 - Google token scopes are unified for Calendar+Gmail so one integration does not break the other.
-- OpenRouter defaults are free-model safe in current config.
+- OpenRouter/Groq defaults are free-model safe in current config.
