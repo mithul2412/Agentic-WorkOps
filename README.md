@@ -1,4 +1,4 @@
-# TicketOps: Real-World Agentic Simulation with Human-in-the-Loop Work Item Tracking and End-to-End Resolution
+# Human-in-the-Loop Agentic Engineering Operations Platform for Work Item Tracking and End-to-End Resolution
 
 FastAPI + LangGraph workflow that triages Jira issues, proposes patches, enforces approval gates, and writes final artifacts to Bitbucket, Jira, Confluence, Google Calendar, and Gmail.
 
